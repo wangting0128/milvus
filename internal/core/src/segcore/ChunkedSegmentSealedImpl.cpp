@@ -193,11 +193,18 @@ ChunkedSegmentSealedImpl::LoadVecIndex(LoadIndexInfo& info) {
             info.dim);
 
     if (request.has_raw_data && get_bit(field_data_ready_bitset_, field_id)) {
-        fields_.rlock()->at(field_id)->ManualEvictCache();
+        drop_field_data_locked(field_id);
     }
     if (get_bit(binlog_index_bitset_, field_id)) {
         set_bit(binlog_index_bitset_, field_id, false);
         vector_indexings_.drop_field_indexing(field_id);
+    }
+    // If the new index does not have raw data but the field data was previously
+    // dropped (by a prior index that did have raw data), we need to reload it.
+    if (!request.has_raw_data && !get_bit(field_data_ready_bitset_, field_id)) {
+        lck.unlock();
+        reload_field_data(field_id);
+        lck.lock();
     }
     vector_indexings_.append_field_indexing(
         field_id, metric_type, std::move(info.cache_index));
@@ -285,7 +292,7 @@ ChunkedSegmentSealedImpl::LoadScalarIndex(LoadIndexInfo& info) {
         !is_pk) {
         // We do not erase the primary key field: if insert record is evicted from memory, when reloading it'll
         // need the pk field again.
-        fields_.rlock()->at(field_id)->ManualEvictCache();
+        drop_field_data_locked(field_id);
     }
     LOG_INFO(
         "Has load scalar index done, fieldID:{}. segmentID:{}, has_raw_data:{}",
@@ -1094,10 +1101,7 @@ ChunkedSegmentSealedImpl::DropFieldData(const FieldId field_id) {
                "Dropping system field is not supported, field id: {}",
                field_id.get());
     std::unique_lock<std::shared_mutex> lck(mutex_);
-    if (get_bit(field_data_ready_bitset_, field_id)) {
-        fields_.wlock()->erase(field_id);
-        set_bit(field_data_ready_bitset_, field_id, false);
-    }
+    drop_field_data_locked(field_id);
     if (get_bit(binlog_index_bitset_, field_id)) {
         set_bit(binlog_index_bitset_, field_id, false);
         vector_indexings_.drop_field_indexing(field_id);
@@ -1112,13 +1116,151 @@ ChunkedSegmentSealedImpl::DropIndex(const FieldId field_id) {
     auto& field_meta = schema_->operator[](field_id);
     AssertInfo(!field_meta.is_vector(), "vector field cannot drop index");
 
-    std::unique_lock lck(mutex_);
-    auto [scalar_indexings, ngram_fields] =
-        lock(folly::wlock(scalar_indexings_), folly::wlock(ngram_fields_));
-    scalar_indexings->erase(field_id);
-    ngram_fields->erase(field_id);
+    bool need_reload = false;
+    {
+        std::unique_lock lck(mutex_);
+        auto [scalar_indexings, ngram_fields] =
+            lock(folly::wlock(scalar_indexings_), folly::wlock(ngram_fields_));
+        scalar_indexings->erase(field_id);
+        ngram_fields->erase(field_id);
 
-    set_bit(index_ready_bitset_, field_id, false);
+        // Check if the dropped index had raw data and field data was cleared.
+        // If so, we need to reload field data since queries will need it.
+        auto iter = index_has_raw_data_.find(field_id);
+        if (iter != index_has_raw_data_.end() && iter->second &&
+            !get_bit(field_data_ready_bitset_, field_id)) {
+            need_reload = true;
+        }
+        set_bit(index_ready_bitset_, field_id, false);
+        index_has_raw_data_.erase(field_id);
+    }
+
+    if (need_reload) {
+        reload_field_data(field_id);
+    }
+}
+
+void
+ChunkedSegmentSealedImpl::drop_field_data_locked(const FieldId field_id) {
+    // NOTE: mutex_ must be already held by caller
+    if (get_bit(field_data_ready_bitset_, field_id)) {
+        // Check if the field is in a multi-field column group.
+        // If so, we cannot safely evict it because other fields share
+        // the same underlying ChunkedColumnGroup cache slot.
+        auto column = get_column(field_id);
+        if (column && column->IsInMultiFieldColumnGroup()) {
+            LOG_INFO(
+                "Skip dropping field data for field {} in segment {} because "
+                "it is in a multi-field column group",
+                field_id.get(),
+                id_);
+            return;
+        }
+        fields_.wlock()->erase(field_id);
+        set_bit(field_data_ready_bitset_, field_id, false);
+    }
+}
+
+void
+ChunkedSegmentSealedImpl::reload_field_data(const FieldId field_id) {
+    // NOTE: This function should be called WITHOUT holding mutex_
+
+    // Check if field data is already loaded
+    {
+        std::shared_lock lck(mutex_);
+        if (get_bit(field_data_ready_bitset_, field_id)) {
+            LOG_INFO(
+                "Skip reloading field data for field {} in segment {} because "
+                "it is already loaded",
+                field_id.get(),
+                id_);
+            return;
+        }
+    }
+
+    if (segment_load_info_.HasManifestPath()) {
+        // StorageV3 path: reload via manifest column groups
+        auto column_groups = segment_load_info_.GetColumnGroups();
+        if (!column_groups) {
+            LOG_WARN(
+                "Cannot reload field data for field {} in segment {} because "
+                "column_groups is null",
+                field_id.get(),
+                id_);
+            return;
+        }
+
+        // Find which column group contains the field_id
+        int64_t target_index = -1;
+        std::vector<FieldId> milvus_field_ids;
+        for (int64_t i = 0; i < column_groups->size(); ++i) {
+            auto column_group = column_groups->at(i);
+            for (const auto& column : column_group->columns) {
+                if (std::stoll(column) == field_id.get()) {
+                    target_index = i;
+                    break;
+                }
+            }
+            if (target_index != -1) {
+                // Collect all field IDs in this column group
+                for (const auto& column : column_group->columns) {
+                    milvus_field_ids.emplace_back(std::stoll(column));
+                }
+                break;
+            }
+        }
+
+        if (target_index != -1) {
+            auto properties =
+                milvus::storage::LoonFFIPropertiesSingleton::GetInstance()
+                    .GetProperties();
+            LoadColumnGroup(column_groups,
+                            properties,
+                            target_index,
+                            milvus_field_ids,
+                            true);
+        } else {
+            LOG_WARN(
+                "Cannot reload field data for field {} in segment {} "
+                "because field not found in manifest column groups",
+                field_id.get(),
+                id_);
+        }
+    } else {
+        // StorageV1/V2 path: reload via LoadFieldData
+        int64_t column_group_id = field_id.get();
+        for (const auto& [id, info] : field_data_info_.field_infos) {
+            if (info.child_field_ids.empty()) {
+                if (id == field_id.get()) {
+                    column_group_id = id;
+                    break;
+                }
+            } else {
+                for (const auto& child_id : info.child_field_ids) {
+                    if (child_id == field_id.get()) {
+                        column_group_id = id;
+                        break;
+                    }
+                }
+            }
+        }
+
+        auto field_info_iter =
+            field_data_info_.field_infos.find(column_group_id);
+        if (field_info_iter != field_data_info_.field_infos.end()) {
+            LoadFieldDataInfo reload_info;
+            reload_info.storage_version = field_data_info_.storage_version;
+            reload_info.load_priority = field_data_info_.load_priority;
+            reload_info.field_infos[column_group_id] = field_info_iter->second;
+            LoadFieldData(reload_info);
+        } else {
+            LOG_WARN(
+                "Cannot reload field data for field {} in segment {} "
+                "because field info not found",
+                field_id.get(),
+                id_);
+        }
+    }
 }
 
 void
@@ -2791,11 +2933,10 @@ ChunkedSegmentSealedImpl::load_field_data_common(
                    field_id.get());
         set_bit(field_data_ready_bitset_, field_id, true);
         update_row_count(num_rows);
-        if (generated_interim_index) {
-            auto column = get_column(field_id);
-            if (column) {
-                column->ManualEvictCache();
-            }
+        auto iter = index_has_raw_data_.find(field_id);
+        if (generated_interim_index && iter != index_has_raw_data_.end() &&
+            iter->second) {
+            drop_field_data_locked(field_id);
         }
         if (data_type == DataType::GEOMETRY &&
             segcore_config_.get_enable_geometry_cache()) {

@@ -452,6 +452,12 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
 
  private:
     void
+    drop_field_data_locked(const FieldId field_id);
+
+    void
+    reload_field_data(const FieldId field_id);
+
+    void
     load_system_field_internal(
         FieldId field_id,
         FieldDataInfo& data,

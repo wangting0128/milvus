@@ -55,11 +55,6 @@ class ChunkedColumnGroup {
 
     virtual ~ChunkedColumnGroup() = default;
 
-    void
-    ManualEvictCache() const {
-        slot_->ManualEvictAll();
-    }
-
     // Get the number of group chunks
     size_t
     num_chunks() const {
@@ -184,11 +179,9 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
           data_type_(field_meta.get_data_type()) {
     }
 
-    void
-    ManualEvictCache() const override {
-        if (group_->NumFieldsInGroup() == 1) {
-            group_->ManualEvictCache();
-        }
+    bool
+    IsInMultiFieldColumnGroup() const override {
+        return group_->NumFieldsInGroup() > 1;
     }
 
     PinWrapper<const char*>
@@ -230,6 +223,10 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
         auto ca = group_->GetGroupChunks(op_ctx, cids);
         for (int64_t i = 0; i < count; i++) {
             auto* group_chunk = ca->get_cell_of(cids[i]);
+            AssertInfo(group_chunk != nullptr,
+                       "GroupChunk is null for chunk_id={}, field_id={}",
+                       cids[i],
+                       field_id_.get());
             auto chunk = group_chunk->GetChunk(field_id_);
             auto valid = chunk->isValid(offsets_in_chunk[i]);
             fn(valid, i);
@@ -439,6 +436,10 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
         auto ca = group_->GetGroupChunks(op_ctx, cids);
         for (int64_t i = 0; i < count; i++) {
             auto* group_chunk = ca->get_cell_of(cids[i]);
+            AssertInfo(group_chunk != nullptr,
+                       "GroupChunk is null for chunk_id={}, field_id={}",
+                       cids[i],
+                       field_id_.get());
             auto chunk = group_chunk->GetChunk(field_id_);
             fn(chunk->ValueAt(offsets_in_chunk[i]), i);
         }
@@ -456,6 +457,10 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
         auto typed_dst = static_cast<T*>(dst);
         for (int64_t i = 0; i < count; i++) {
             auto* group_chunk = ca->get_cell_of(cids[i]);
+            AssertInfo(group_chunk != nullptr,
+                       "GroupChunk is null for chunk_id={}, field_id={}",
+                       cids[i],
+                       field_id_.get());
             auto chunk = group_chunk->GetChunk(field_id_);
             auto value = chunk->ValueAt(offsets_in_chunk[i]);
             typed_dst[i] =
@@ -544,6 +549,10 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
         auto dst_vec = reinterpret_cast<char*>(dst);
         for (int64_t i = 0; i < count; i++) {
             auto* group_chunk = ca->get_cell_of(cids[i]);
+            AssertInfo(group_chunk != nullptr,
+                       "GroupChunk is null for chunk_id={}, field_id={}",
+                       cids[i],
+                       field_id_.get());
             auto chunk = group_chunk->GetChunk(field_id_);
             auto value = chunk->ValueAt(offsets_in_chunk[i]);
             memcpy(dst_vec + i * element_sizeof, value, element_sizeof);
@@ -581,6 +590,10 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
             auto ca = group_->GetGroupChunks(op_ctx, cids);
             for (int64_t i = 0; i < count; i++) {
                 auto* group_chunk = ca->get_cell_of(cids[i]);
+                AssertInfo(group_chunk != nullptr,
+                           "GroupChunk is null for chunk_id={}, field_id={}",
+                           cids[i],
+                           field_id_.get());
                 auto chunk = group_chunk->GetChunk(field_id_);
                 auto valid = chunk->isValid(offsets_in_chunk[i]);
                 auto value = static_cast<StringChunk*>(chunk.get())
@@ -610,6 +623,10 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
 
         for (int64_t i = 0; i < count; i++) {
             auto* group_chunk = ca->get_cell_of(cids[i]);
+            AssertInfo(group_chunk != nullptr,
+                       "GroupChunk is null for chunk_id={}, field_id={}",
+                       cids[i],
+                       field_id_.get());
             auto chunk = group_chunk->GetChunk(field_id_);
             auto valid = chunk->isValid(offsets_in_chunk[i]);
             auto str_view = static_cast<StringChunk*>(chunk.get())
@@ -640,6 +657,10 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
 
         for (int64_t i = 0; i < count; i++) {
             auto* group_chunk = ca->get_cell_of(cids[i]);
+            AssertInfo(group_chunk != nullptr,
+                       "GroupChunk is null for chunk_id={}, field_id={}",
+                       cids[i],
+                       field_id_.get());
             auto chunk = group_chunk->GetChunk(field_id_);
             auto str_view = static_cast<StringChunk*>(chunk.get())
                                 ->
@@ -665,6 +686,10 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
         auto ca = group_->GetGroupChunks(op_ctx, cids);
         for (int64_t i = 0; i < count; i++) {
             auto* group_chunk = ca->get_cell_of(cids[i]);
+            AssertInfo(group_chunk != nullptr,
+                       "GroupChunk is null for chunk_id={}, field_id={}",
+                       cids[i],
+                       field_id_.get());
             auto chunk = group_chunk->GetChunk(field_id_);
             auto view = static_cast<ArrayChunk*>(chunk.get())
                             ->View(offsets_in_chunk[i]);
@@ -686,6 +711,10 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
         auto ca = group_->GetGroupChunks(op_ctx, cids);
         for (int64_t i = 0; i < count; i++) {
             auto* group_chunk = ca->get_cell_of(cids[i]);
+            AssertInfo(group_chunk != nullptr,
+                       "GroupChunk is null for chunk_id={}, field_id={}",
+                       cids[i],
+                       field_id_.get());
             auto chunk = group_chunk->GetChunk(field_id_);
             auto array = static_cast<VectorArrayChunk*>(chunk.get())
                              ->View(offsets_in_chunk[i])

@@ -27,9 +27,9 @@ class ChunkedColumnInterface {
  public:
     virtual ~ChunkedColumnInterface() = default;
 
-    // Default implementation does nothing.
-    virtual void
-    ManualEvictCache() const {
+    virtual bool
+    IsInMultiFieldColumnGroup() const {
+        return false;
     }
 
     // Get raw data pointer of a specific chunk
